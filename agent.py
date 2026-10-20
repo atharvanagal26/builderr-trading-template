@@ -1,347 +1,260 @@
-"""Calmar Rotation Hybrid.
+import numpy as np
+import pandas as pd
+import warnings
 
-Contest objective: maximize 60-day forward Calmar, not raw return.
+warnings.filterwarnings("ignore")
 
-The agent uses only the provided daily bars. It has no network calls, no LLM,
-no API keys, and no dependencies outside the Python standard library.
+class InstitutionalAVSEEngine:
+    """
+    Adaptive Volatility Squeeze & Efficiency Parity Engine (AVSE)
+    Customized for active paper trading challenges requiring high trade turnover,
+    strict risk parity, and rapid exit execution.
+    """
 
-Core idea:
-  * Risk-off when SPY/QQQ lose their 50-day trends or QQQ volatility is high.
-  * Risk-on rotates into the strongest broad/sector/mega-cap sleeves.
-  * A small 2x ETF overlay is allowed only in calm QQQ uptrends.
-  * Every target is capped below 24% and beta-adjusted gross is scaled below 1.35x.
-"""
-from __future__ import annotations
+    @staticmethod
+    def calculate_efficiency_ratio(closes: np.ndarray, period: int = 14) -> float:
+        """Calculates Kaufman Efficiency Ratio (KER) to score directional momentum vs noise."""
+        if len(closes) < period + 1:
+            return 0.50
+        net_change = abs(closes[-1] - closes[-period - 1])
+        sum_changes = np.sum(np.abs(np.diff(closes[-period - 1:])))
+        if sum_changes == 0:
+            return 0.0
+        return float(np.clip(net_change / sum_changes, 0.0, 1.0))
 
-from math import sqrt
-from statistics import mean, pstdev
-from typing import Any
-
-# Public v0 universe. Keep leveraged names out of the ranker; only use them as
-# a tightly gated overlay.
-RISK_CANDIDATES = (
-    "SPY", "QQQ", "DIA", "IWM",
-    "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLRE", "XLC", "SMH",
-    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA",
-)
-DEFENSIVE_WEIGHTS = (
-    ("XLP", 0.24),
-    ("XLU", 0.24),
-    ("XLV", 0.20),
-    ("XLE", 0.12),
-)
-BETA_MULTIPLE = {
-    "TQQQ": 3.0, "SOXL": 3.0, "UPRO": 3.0, "SPXL": 3.0, "TNA": 3.0,
-    "FAS": 3.0, "TECL": 3.0, "LABU": 3.0, "CURE": 3.0, "DRN": 3.0,
-    "UDOW": 3.0, "NAIL": 3.0,
-    "QLD": 2.0, "SSO": 2.0, "DDM": 2.0, "ROM": 2.0, "UWM": 2.0, "AGQ": 2.0,
-}
-
-REBALANCE_EVERY_DAYS = 5
-MAX_WEIGHT = 0.24
-DRIFT_LIMIT = 0.27
-MAX_BETA_GROSS = 1.35
-MIN_TRADE_PCT = 0.015
-
-_last_rebalance_bar_date: str | None = None
-_last_targets: dict[str, float] = {}
-
-
-def closes(bars: list[dict[str, Any]] | None) -> list[float]:
-    if not bars:
-        return []
-    out: list[float] = []
-    for bar in bars:
+    @classmethod
+    def evaluate_asset(cls, df: pd.DataFrame) -> dict:
+        metrics = {
+            "signal": "HOLD",
+            "alpha_score": 0.0,
+            "atr_pct": 0.015,
+            "price": 0.0,
+            "squeeze_active": False,
+        }
         try:
-            close = float(bar["close"])
-        except (KeyError, TypeError, ValueError):
-            return []
-        if close <= 0:
-            return []
-        out.append(close)
-    return out
+            if df is None or len(df) < 25:
+                return metrics
+
+            # Normalize DataFrame column names
+            col_map = {str(c).lower().strip(): c for c in df.columns}
+            close_key = col_map.get("close", col_map.get("price", df.columns[-1]))
+            high_key = col_map.get("high", close_key)
+            low_key = col_map.get("low", close_key)
+            vol_key = col_map.get("volume", col_map.get("vol", None))
+
+            closes = df[close_key].to_numpy(dtype=float)
+            highs = df[high_key].to_numpy(dtype=float)
+            lows = df[low_key].to_numpy(dtype=float)
+
+            volumes = df[vol_key].to_numpy(dtype=float) if vol_key and vol_key in df.columns else np.ones_like(closes)
+
+            current_price = float(closes[-1])
+            if current_price <= 0 or np.isnan(current_price):
+                return metrics
+            metrics["price"] = current_price
+
+            prices_series = pd.Series(closes)
+
+            # 1. Kaufman Efficiency Ratio
+            ker = cls.calculate_efficiency_ratio(closes, period=14)
+
+            # 2. Average True Range (ATR)
+            hl = highs - lows
+            prev_close = np.roll(closes, 1)
+            prev_close[0] = closes[0]
+            hc = np.abs(highs - prev_close)
+            lc = np.abs(lows - prev_close)
+            tr = np.maximum(hl, np.maximum(hc, lc))
+            atr = pd.Series(tr).rolling(window=14, min_periods=1).mean().to_numpy()[-1]
+            if np.isnan(atr) or atr <= 0:
+                atr = current_price * 0.015
+            metrics["atr_pct"] = float(atr / current_price)
+
+            # 3. TTM Squeeze Detection
+            sma_20 = prices_series.rolling(20, min_periods=1).mean().to_numpy()[-1]
+            std_20 = prices_series.rolling(20, min_periods=1).std().to_numpy()[-1]
+
+            bb_upper = sma_20 + (2.0 * std_20)
+            bb_lower = sma_20 - (2.0 * std_20)
+            kc_upper = sma_20 + (1.5 * atr)
+            kc_lower = sma_20 - (1.5 * atr)
+
+            squeeze = (bb_upper < kc_upper) and (bb_lower > kc_lower)
+            metrics["squeeze_active"] = squeeze
+
+            # 4. Relative Strength Index (RSI - 10 period)
+            delta = prices_series.diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=10, min_periods=1).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=10, min_periods=1).mean()
+            rs = gain / (loss + 1e-6)
+            rsi = float((100 - (100 / (1 + rs))).to_numpy()[-1])
+
+            # 5. Volume Shock & Momentum
+            vol_ma = pd.Series(volumes).rolling(14, min_periods=1).mean().to_numpy()[-1]
+            vol_ratio = float(volumes[-1] / (vol_ma + 1e-6))
+            roc_3 = (closes[-1] - closes[-4]) / (closes[-4] + 1e-6) if len(closes) >= 4 else 0.0
+
+            # --- REGIME-BASED SIGNAL SELECTION ---
+            if ker >= 0.40:  # Directional Trend / Micro-Breakout Regime
+                is_breakout = (current_price > bb_upper) or (roc_3 > 0.012 and vol_ratio > 1.1)
+                if is_breakout and rsi < 72:
+                    metrics["signal"] = "BUY"
+                    metrics["alpha_score"] = float(np.clip((ker * 40.0) + (roc_3 * 2000.0) + (vol_ratio * 10.0), 1.0, 100.0))
+                elif current_price < sma_20 or rsi > 75:
+                    metrics["signal"] = "SELL"
+            else:  # Mean Reversion / Squeeze Release Regime
+                if current_price <= (sma_20 - (1.2 * atr)) or rsi < 36:
+                    metrics["signal"] = "BUY"
+                    metrics["alpha_score"] = float(np.clip((40.0 - rsi) * 2.0 + (vol_ratio * 5.0), 1.0, 100.0))
+                elif current_price >= sma_20 or rsi > 62:
+                    metrics["signal"] = "SELL"
+
+            return metrics
+        except Exception as e:
+            print(f"Error evaluating asset: {e}")
+            return metrics
 
 
-def sma(values: list[float], n: int) -> float | None:
-    if len(values) < n:
-        return None
-    return mean(values[-n:])
-
-
-def momentum(values: list[float], n: int) -> float | None:
-    if len(values) <= n:
-        return None
-    start = values[-(n + 1)]
-    if start <= 0:
-        return None
-    return values[-1] / start - 1.0
-
-
-def realized_vol(values: list[float], n: int) -> float | None:
-    if len(values) <= n:
-        return None
-    window = values[-(n + 1):]
-    rets = []
-    for i in range(1, len(window)):
-        prev = window[i - 1]
-        if prev <= 0:
-            return None
-        rets.append(window[i] / prev - 1.0)
-    if len(rets) < 5:
-        return None
-    return pstdev(rets) * sqrt(252.0)
-
-
-def current_positions(portfolio_state: dict[str, Any]) -> dict[str, dict[str, float]]:
-    positions: dict[str, dict[str, float]] = {}
-    for raw in portfolio_state.get("positions", []) or []:
-        ticker = str(raw.get("ticker", "")).upper()
-        if not ticker:
-            continue
-        try:
-            qty = float(raw.get("quantity", 0.0))
-            avg_cost = float(raw.get("avg_cost", 0.0))
-        except (TypeError, ValueError):
-            continue
-        if qty <= 0:
-            continue
-        existing = positions.setdefault(ticker, {"quantity": 0.0, "avg_cost": avg_cost})
-        existing["quantity"] += qty
-        existing["avg_cost"] = avg_cost or existing["avg_cost"]
-    return positions
-
-
-def equity(portfolio_state: dict[str, Any], cash: float) -> float:
+def decide(market_state: dict, portfolio_state: dict, cash: float) -> list:
+    """
+    Main execution loop invoked by the Builderr paper trading platform.
+    """
     try:
-        total = float(portfolio_state.get("cash", cash))
-    except (TypeError, ValueError):
-        total = float(cash or 0.0)
-    last_prices = portfolio_state.get("last_prices", {}) or {}
-    for ticker, pos in current_positions(portfolio_state).items():
-        try:
-            price = float(last_prices.get(ticker, pos["avg_cost"]))
-        except (TypeError, ValueError):
-            price = pos["avg_cost"]
-        total += pos["quantity"] * max(price, 0.0)
-    return max(total, 0.0)
+        orders = []
+        if not market_state:
+            return orders
 
+        total_portfolio_value = float(cash)
+        current_gross_exposure = 0.0
+        current_positions = {}
+        active_prices = {}
 
-def _latest_bar_date(market_state: dict[str, list[dict[str, Any]]]) -> str | None:
-    bars = market_state.get("SPY") or market_state.get("QQQ") or []
-    if not bars:
-        return None
-    ts = bars[-1].get("ts")
-    if ts is None:
-        return str(len(bars))
-    # ISO dates sort lexicographically; keeping the first 10 chars handles both
-    # YYYY-MM-DD and full timestamps.
-    return str(ts)[:10]
+        # 1. Parse current portfolio state
+        for ticker, p_val in portfolio_state.items():
+            qty_held = p_val.get('quantity', p_val.get('qty', 0)) if isinstance(p_val, dict) else p_val
+            if qty_held and float(qty_held) > 0:
+                current_positions[ticker] = float(qty_held)
 
+        # 2. Extract latest market prices
+        for ticker, bars in market_state.items():
+            if bars:
+                try:
+                    last_bar = bars[-1]
+                    price = last_bar.get("close", last_bar.get("price", last_bar.get("open", 0)))
+                    if price and float(price) > 0:
+                        active_prices[ticker] = float(price)
+                except Exception:
+                    continue
 
-def _days_since_rebalance(market_state: dict[str, list[dict[str, Any]]]) -> int | None:
-    if _last_rebalance_bar_date is None:
-        return None
-    bars = market_state.get("SPY") or market_state.get("QQQ") or []
-    dates = [str(b.get("ts", i))[:10] for i, b in enumerate(bars)]
-    if not dates or _last_rebalance_bar_date not in dates:
-        return None
-    return len(dates) - dates.index(_last_rebalance_bar_date) - 1
+        for ticker, qty in current_positions.items():
+            if ticker in active_prices:
+                pos_val = qty * active_prices[ticker]
+                total_portfolio_value += pos_val
+                current_gross_exposure += pos_val
 
+        available_cash = float(cash)
+        buy_candidates = []
 
-def _market_prices(market_state: dict[str, list[dict[str, Any]]]) -> dict[str, float]:
-    prices: dict[str, float] = {}
-    for ticker, bars in market_state.items():
-        cs = closes(bars)
-        if cs:
-            prices[ticker.upper()] = cs[-1]
-    return prices
+        # 3. Process Sell Exits and Trailing Stops
+        for ticker, bars in market_state.items():
+            if not bars or len(bars) < 15:
+                continue
 
+            try:
+                df = pd.DataFrame(bars)
+                analysis = InstitutionalAVSEEngine.evaluate_asset(df)
+                current_price = active_prices.get(ticker, analysis["price"])
 
-def _risk_off_targets(market_state: dict[str, list[dict[str, Any]]]) -> dict[str, float]:
-    return {ticker: weight for ticker, weight in DEFENSIVE_WEIGHTS if closes(market_state.get(ticker))}
+                if current_price <= 0:
+                    continue
 
+                qty_held = current_positions.get(ticker, 0.0)
 
-def _scale_caps(weights: dict[str, float]) -> dict[str, float]:
-    capped = {t: min(max(w, 0.0), MAX_WEIGHT) for t, w in weights.items() if w > 0.0}
-    beta_gross = sum(w * BETA_MULTIPLE.get(t, 1.0) for t, w in capped.items())
-    if beta_gross > MAX_BETA_GROSS:
-        scale = MAX_BETA_GROSS / beta_gross
-        capped = {t: w * scale for t, w in capped.items()}
-    return {t: round(w, 6) for t, w in capped.items() if w > 0.001}
+                if qty_held > 0:
+                    col_map = {str(c).lower().strip(): c for c in df.columns}
+                    close_key = col_map.get('close', col_map.get('price', df.columns[-1]))
+                    closes_lookback = df[close_key].to_numpy(dtype=float)
 
+                    recent_peak = float(np.max(closes_lookback[-10:]))
+                    stop_price = recent_peak * (1.0 - (1.8 * analysis["atr_pct"]))
 
-def target_weights(market_state: dict[str, list[dict[str, Any]]]) -> dict[str, float]:
-    spy = closes(market_state.get("SPY"))
-    qqq = closes(market_state.get("QQQ"))
-    if len(spy) < 50 or len(qqq) < 50:
-        return {}
+                    if current_price < stop_price or analysis["signal"] == "SELL":
+                        orders.append({
+                            "ticker": str(ticker),
+                            "side": "sell",
+                            "quantity": int(qty_held)
+                        })
+                        current_gross_exposure -= (qty_held * current_price)
+                        available_cash += (qty_held * current_price)
+                        current_positions[ticker] = 0.0
+                        continue
 
-    spy_sma50 = sma(spy, 50)
-    qqq_sma50 = sma(qqq, 50)
-    qqq_vol20 = realized_vol(qqq, 20)
-    risk_on = bool(
-        spy_sma50 is not None
-        and qqq_sma50 is not None
-        and qqq_vol20 is not None
-        and spy[-1] > spy_sma50
-        and qqq[-1] > qqq_sma50
-        and qqq_vol20 < 0.35
-    )
-    if not risk_on:
-        return _scale_caps(_risk_off_targets(market_state))
+                if analysis["signal"] == "BUY":
+                    buy_candidates.append({
+                        "ticker": str(ticker),
+                        "price": float(current_price),
+                        "score": float(analysis["alpha_score"]),
+                        "atr_pct": float(analysis["atr_pct"]),
+                        "qty_held": float(qty_held)
+                    })
+            except Exception as e:
+                print(f"Error processing exits for {ticker}: {e}")
+                continue
 
-    scored: list[tuple[float, str]] = []
-    for ticker in RISK_CANDIDATES:
-        values = closes(market_state.get(ticker))
-        if len(values) < 61:
-            continue
-        mom60 = momentum(values, 60)
-        mom20 = momentum(values, 20)
-        trend50 = sma(values, 50)
-        vol20 = realized_vol(values, 20)
-        if mom60 is None or mom20 is None or trend50 is None or vol20 is None:
-            continue
-        trend_gap = values[-1] / trend50 - 1.0
-        score = (0.55 * mom60) + (0.25 * mom20) + (0.20 * trend_gap) - (0.15 * vol20)
-        if score > 0.0:
-            scored.append((score, ticker))
+        # 4. Capital Allocation (Volatility Risk Parity)
+        max_leverage_limit = 1.38
+        max_allowed_exposure = total_portfolio_value * max_leverage_limit
+        buy_candidates = sorted(buy_candidates, key=lambda x: x["score"], reverse=True)
 
-    scored.sort(reverse=True)
-    winners = [ticker for _, ticker in scored[:5]]
-    if not winners:
-        return _scale_caps(_risk_off_targets(market_state))
+        for candidate in buy_candidates:
+            remaining_leverage = max_allowed_exposure - current_gross_exposure
+            if remaining_leverage <= 0 or available_cash <= 10:
+                break
 
-    qqq_sma20 = sma(qqq, 20)
-    qqq_mom20 = momentum(qqq, 20)
-    overlay_on = bool(
-        qqq_sma20 is not None
-        and qqq_sma50 is not None
-        and qqq_mom20 is not None
-        and qqq_sma20 > qqq_sma50
-        and qqq_mom20 > 0.0
-        and qqq_vol20 < 0.28
-        and closes(market_state.get("QLD"))
-        and closes(market_state.get("SSO"))
-    )
+            ticker = candidate["ticker"]
+            price = candidate["price"]
+            atr_pct = candidate["atr_pct"]
+            qty_held = candidate["qty_held"]
 
-    weights: dict[str, float] = {}
-    base_budget = 0.76 if overlay_on else 0.92
-    per_winner = min(MAX_WEIGHT - 0.02, base_budget / len(winners))
-    for ticker in winners:
-        weights[ticker] = per_winner
+            target_pct = min(0.28, max(0.12, 0.025 / (atr_pct + 1e-4)))
+            target_alloc = total_portfolio_value * target_pct
+            needed_spend = target_alloc - (qty_held * price)
 
-    if overlay_on:
-        weights["QLD"] = 0.11
-        weights["SSO"] = 0.07
+            if needed_spend <= 0:
+                continue
 
-    return _scale_caps(weights)
+            spend_amount = min(needed_spend, available_cash * 0.90, remaining_leverage)
 
+            # Lowered threshold from 0.04 to 0.005 to permit smaller valid allocations
+            if spend_amount > (total_portfolio_value * 0.005):
+                quantity = int(spend_amount / price)
+                if quantity > 0:
+                    orders.append({
+                        "ticker": str(ticker),
+                        "side": "buy",
+                        "quantity": int(quantity)
+                    })
+                    available_cash -= (quantity * price)
+                    current_gross_exposure += (quantity * price)
 
-def orders_to_rebalance(
-    targets: dict[str, float],
-    positions: dict[str, dict[str, float]],
-    total_equity: float,
-    prices: dict[str, float],
-    cash_available: float,
-) -> list[dict[str, object]]:
-    if total_equity <= 0:
+        return orders
+
+    except Exception as e:
+        print(f"Fatal error in decide loop: {e}")
         return []
 
-    min_trade = total_equity * MIN_TRADE_PCT
-    orders: list[dict[str, object]] = []
-    sell_proceeds = 0.0
+# --- LOCAL TEST RUNNER ---
+if __name__ == "__main__":
+    # Mock data to test your bot locally
+    sample_market_state = {
+        "AAPL": [
+            {"open": 150.0, "high": 152.0, "low": 149.0, "close": 151.5, "volume": 10000}
+            for _ in range(30)
+        ]
+    }
+    sample_portfolio_state = {}
+    sample_cash = 10000.0
 
-    # Sells first: remove stale holdings and trim overweight target holdings.
-    for ticker, pos in positions.items():
-        price = prices.get(ticker)
-        if price is None or price <= 0:
-            continue
-        qty = pos["quantity"]
-        current_value = qty * price
-        target_value = total_equity * targets.get(ticker, 0.0)
-        delta = target_value - current_value
-        if ticker not in targets:
-            sell_qty = int(qty)
-            if sell_qty > 0 and current_value >= min_trade:
-                orders.append({"ticker": ticker, "side": "sell", "quantity": sell_qty})
-                sell_proceeds += sell_qty * price
-        elif delta < -min_trade:
-            sell_qty = min(int(abs(delta) // price), int(qty))
-            if sell_qty > 0:
-                orders.append({"ticker": ticker, "side": "sell", "quantity": sell_qty})
-                sell_proceeds += sell_qty * price
-
-    spendable = max(float(cash_available), 0.0) + (sell_proceeds * 0.98)
-
-    # Buys second: use expected cash after sells and skip tiny adjustments.
-    for ticker, weight in sorted(targets.items()):
-        price = prices.get(ticker)
-        if price is None or price <= 0:
-            continue
-        current_qty = positions.get(ticker, {}).get("quantity", 0.0)
-        current_value = current_qty * price
-        target_value = total_equity * weight
-        delta = target_value - current_value
-        if delta < min_trade:
-            continue
-        buy_value = min(delta, spendable)
-        buy_qty = int(buy_value // price)
-        if buy_qty > 0:
-            orders.append({"ticker": ticker, "side": "buy", "quantity": buy_qty})
-            spendable -= buy_qty * price
-
-    return orders[:45]
-
-
-def _has_position_drifted(portfolio_state: dict[str, Any], total_equity: float) -> bool:
-    if total_equity <= 0:
-        return False
-    last_prices = portfolio_state.get("last_prices", {}) or {}
-    for ticker, pos in current_positions(portfolio_state).items():
-        try:
-            price = float(last_prices.get(ticker, pos["avg_cost"]))
-        except (TypeError, ValueError):
-            price = pos["avg_cost"]
-        if price > 0 and (pos["quantity"] * price / total_equity) > DRIFT_LIMIT:
-            return True
-    return False
-
-
-def decide(
-    market_state: dict,
-    portfolio_state: dict,
-    cash: float,
-) -> list[dict]:
-    """Return a list of long-only buy/sell orders."""
-    global _last_rebalance_bar_date, _last_targets
-
-    if not market_state:
-        return []
-
-    latest_date = _latest_bar_date(market_state)
-    if latest_date is None:
-        return []
-
-    total_equity = equity(portfolio_state, cash)
-    days_since = _days_since_rebalance(market_state)
-    drifted = _has_position_drifted(portfolio_state, total_equity)
-    should_rebalance = (
-        _last_rebalance_bar_date is None
-        or days_since is None
-        or days_since >= REBALANCE_EVERY_DAYS
-        or drifted
-    )
-    if not should_rebalance:
-        return []
-
-    targets = target_weights(market_state)
-    if not targets:
-        return []
-
-    prices = _market_prices(market_state)
-    positions = current_positions(portfolio_state)
-    orders = orders_to_rebalance(targets, positions, total_equity, prices, cash)
-    if orders:
-        _last_rebalance_bar_date = latest_date
-        _last_targets = targets
-    return orders
+    print("Running local test simulation...")
+    orders = decide(sample_market_state, sample_portfolio_state, sample_cash)
+    print("Generated Orders:", orders)
